@@ -1,0 +1,250 @@
+#pragma once
+
+#include <string>
+#include <mutex>
+#include "onnxruntime_cxx_api.h"
+#include <fstream>
+#include <iostream>
+#include <climits>
+#include <ctime>
+#include "frontend/wav.h"
+using namespace std;
+
+class Vad {
+public:
+    Vad(){
+        ortMutex_.lock();
+        //string modelPath = "/home/mathew/workplace/avatr-vad-classed/res/silero_vad.onnx-outdated";
+        //string modelPath = "/home/mathew/workplace/avatr-vad-classed/res/silero_vad.onnx";
+        string modelPath = "res/silero_vad.onnx";
+        if (!ortSession_) {
+            ortEnv_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING,
+                                            "SpeechRecorder::ChunkProcessor");
+            ortMemory_ = std::make_unique<Ort::MemoryInfo>(Ort::MemoryInfo::CreateCpu(
+                OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault));
+
+            Ort::SessionOptions sessionOptions;
+            sessionOptions.SetIntraOpNumThreads(1);
+            ortSession_ = std::make_unique<Ort::Session>(*ortEnv_, modelPath.c_str(), sessionOptions);
+	    }
+	    ortMutex_.unlock();
+
+            size_t num_input_nodes = ortSession_->GetInputCount();
+            size_t num_output_nodes = ortSession_->GetOutputCount();
+            std::vector<const char*> input_node_names(num_input_nodes);
+            std::vector<const char*> output_node_names(num_output_nodes);
+            Ort::AllocatorWithDefaultOptions allocator;
+
+            for (int i = 0; i < num_input_nodes; i++) {
+                char* input_name = ortSession_->GetInputName(i, allocator);
+                printf("Input %d : name=%s\n", i, input_name);
+                input_node_names[i] = input_name;
+
+                Ort::TypeInfo type_info = ortSession_->GetInputTypeInfo(i);
+                auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+                ONNXTensorElementDataType type = tensor_info.GetElementType();
+                printf("Input %d : type=%d\n", i, type);
+
+                std::vector<int64_t> input_node_dims = tensor_info.GetShape();
+                for (int j = 0; j < input_node_dims.size(); j++) {
+                    printf("Input %d : dim %d=%jd\n", i, j, input_node_dims[j]);
+                    if (input_node_dims[j] < 1)
+                    {
+                        bool dynamic_flag  = true;
+                    }
+                }
+            }
+
+            for (int i = 0; i < num_output_nodes; i++) {
+                char* output_name = ortSession_->GetOutputName(i, allocator);
+                printf("Input %d : name=%s\n", i, output_name);
+                output_node_names[i] = output_name;
+
+                Ort::TypeInfo type_info = ortSession_->GetOutputTypeInfo(i);
+                auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+                ONNXTensorElementDataType type = tensor_info.GetElementType();
+                printf("Output %d : type=%d\n", i, type);
+
+                std::vector<int64_t> output_node_dims = tensor_info.GetShape();
+                for (int j = 0; j < output_node_dims.size(); j++) {
+                    printf("Output %d : dim %d=%jd\n", i, j, output_node_dims[j]);
+                }
+            }
+
+
+	    outputTensors.emplace_back(Ort::Value::CreateTensor<float>(
+		    *ortMemory_, outputTensorValues_.data(), outputTensorValues_.size(),
+	        outputDimensions.data(), outputDimensions.size()));
+    }
+
+    bool process(vector<int16_t> chunk) {
+        vector<float> data(chunk.size(), 0);
+        for(int i=0;i<chunk.size();i++){
+            //data[i] = (float)chunk[i]/ (float)SHRT_MAX;
+            data[i] = chunk[i];
+        }
+
+	    vector<int64_t> shape{2,1,64};
+	    size_t size = 1;
+	    for(int i=0;i<shape.size();i++){
+		    size *= shape[i];
+	    }
+	    vector<float> value(size, 0);
+
+        inputDimensions[1] = data.size();
+        vector<int64_t> input_sr_dims{1};
+
+        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(*ortMemory_, 
+			data.data(), data.size(), inputDimensions.data(), inputDimensions.size());
+        Ort::Value sr_tensor = Ort::Value::CreateTensor<int64_t>(*ortMemory_, 
+			&sample_rate_, sizeof(sample_rate_), input_sr_dims.data(), input_sr_dims.size());        
+		Ort::Value h_tensor = Ort::Value::CreateTensor<float>(*ortMemory_,
+			value.data(), size, shape.data(), shape.size());
+		Ort::Value c_tensor = Ort::Value::CreateTensor<float>(*ortMemory_,
+			value.data(), size, shape.data(), shape.size());
+
+		std::vector<Ort::Value> ort_inputs;
+		ort_inputs.emplace_back(std::move(input_tensor));
+		ort_inputs.emplace_back(std::move(sr_tensor));
+		ort_inputs.emplace_back(std::move(h_tensor));
+		ort_inputs.emplace_back(std::move(c_tensor));
+
+		ortSession_->Run(Ort::RunOptions{nullptr}, inputNames_.data(),
+				ort_inputs.data(), ort_inputs.size(), outputNames_.data(),
+				outputTensors.data(), 1);
+
+		float probability = outputTensorValues_[0];
+        std::cout<<"probability : " <<probability<<std::endl;
+        bool speaking = speaking_ ? probability > sileroVadSilenceThreshold_
+                            : probability > sileroVadSpeakingThreshold_;
+		if (speaking) {
+    		consecutiveSilence_ = 0;
+			consecutiveSpeaking_++;
+            vad_status_ = 2;
+		} else {
+			consecutiveSilence_++;
+			consecutiveSpeaking_ = 0;
+            vad_status_ = 0;
+		}
+
+		if (!speaking_ &&
+     		consecutiveSpeaking_ == consecutiveFramesForSpeaking) {
+			speaking_ = true;
+            vad_status_ = 1; 
+		}
+
+		if (speaking_ &&
+      		consecutiveSilence_ == consecutiveFramesForSilence) {
+			speaking_ = false;
+            vad_status_ = 3; 
+		}
+
+        if(speaking_ && vad_status_ != 1){
+            vad_status_ = 2;
+        }
+
+        if(!speaking_ && vad_status_ != 3){
+            vad_status_ = 0;
+        }
+
+		//std::cout<<frame_idx_++ <<"\t" << probability<<"\t"<<speaking<<"\t"<<speaking_<<std::endl;
+        return speaking_;
+    }
+
+    int status(){
+        return vad_status_;
+    }
+
+private:
+    std::mutex ortMutex_;
+    std::unique_ptr<Ort::Env> ortEnv_;
+    std::unique_ptr<Ort::MemoryInfo> ortMemory_;
+    std::unique_ptr<Ort::Session> ortSession_;
+
+    int consecutiveSilence_ = 0;
+  	int consecutiveSpeaking_ = 0;
+	//int consecutiveFramesForSilence = 5;
+    int consecutiveFramesForSilence = 10;
+	int consecutiveFramesForSpeaking = 1;
+
+    int64_t sample_rate_ = 16000;
+    bool speaking_ = false;
+
+    //vector<const char *> inputNames_{"input", "h0", "c0"};
+    vector<const char *> inputNames_{"input", "sr", "h", "c"};
+    vector<const char *> outputNames_{"output", "hn", "cn"};
+
+    float sileroVadSilenceThreshold_ = 0.3;
+    //float sileroVadSpeakingThreshold_ = 0.1;
+    float sileroVadSpeakingThreshold_ = 0.3;
+    int frame_idx_=0;
+
+    std::vector<int64_t> inputDimensions{1, 512};
+    std::vector<int64_t> inputsr_dims{1, 1};
+    std::vector<int64_t> outputDimensions{1, 1};   
+    std::vector<float> outputTensorValues_{0,};
+    std::vector<float> h_;
+    std::vector<Ort::Value> outputTensors;
+    int vad_status_ = 0;
+};
+
+/*
+
+
+struct ChunkProcessorOptions {
+    int consecutiveFramesForSilence = 5;
+    int consecutiveFramesForSpeaking = 1;
+    int device = -1;
+    int leadingBufferFrames = 10;
+    std::function<void(std::vector<short>)> onChunkStart = nullptr;
+    std::function<void(std::vector<short>, bool, double, bool, double, int)>
+        onAudio = nullptr;
+    std::function<void()> onChunkEnd = nullptr;
+    int samplesPerFrame = 480;
+    int sampleRate = 16000;
+    int sileroVadBufferSize = 2000;
+    int sileroVadRateLimit = 3;
+    double sileroVadSilenceThreshold = 0.1;
+    double sileroVadSpeakingThreshold = 0.3;
+    int webrtcVadLevel = 3;
+    int webrtcVadBufferSize = 480;
+    int webrtcVadResultsSize = 10;
+};
+
+
+class Vad {
+    void ChunkProcessor::Reset() {
+        consecutiveSilence_ = 0;
+        consecutiveSpeaking_ = 0;
+        framesUntilSileroVad_ = 0;
+        leadingBuffer_.clear();
+        speaking_ = false;
+        webrtcVad_.Reset();
+        webrtcVadBuffer_.clear();
+        webrtcVadResults_.clear();
+        short* audio;
+        while (queue_.try_dequeue(audio)) {
+        }
+    }
+
+ private:
+    std::vector<short> leadingBuffer_;
+    int consecutiveSilence_ = 0;
+    int consecutiveSpeaking_ = 0;
+    int framesUntilSileroVad_ = 0;
+    Microphone microphone_;
+    BlockingReaderWriterQueue<short*> queue_;
+    std::vector<float> sileroBuffer_;
+    double sileroVadProbability_ = 0.0;
+    bool speaking_ = false;
+    std::atomic<bool> stopped_;
+    std::mutex toggleLock_;
+    std::thread startThread_;
+    std::thread stopThread_;
+    std::thread queueThread_;
+    WebrtcVad webrtcVad_;
+    std::vector<short> webrtcVadBuffer_;
+    std::vector<bool> webrtcVadResults_;
+}
+
+*/
